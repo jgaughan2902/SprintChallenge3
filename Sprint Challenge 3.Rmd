@@ -1,0 +1,499 @@
+---
+title: "WBB API"
+output: html_document
+date: "2025-11-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Question 2 (Win Probability Model)
+
+#### Load Packages
+```{r output = F}
+library(tidyverse)
+library(nflfastR)
+library(dplyr)
+library(scales)
+library(readxl)
+library(caTools)
+library(broom)
+```
+
+#### Load the data and merge rows
+```{r, include = FALSE}
+pbp2021 <- load_pbp(2021)
+pbp2022 <- load_pbp(2022)
+pbp2023 <- load_pbp(2023)
+
+pbpfull = bind_rows(pbp2021, pbp2022, pbp2023)
+rm(pbp2021, pbp2022, pbp2023)
+
+#head(pbpfull)
+```
+
+```{r, include = FALSE}
+pbpfull = pbpfull %>% mutate(winteam = ifelse(result > 0, 
+                                              home_team, 
+                                              ifelse(result == 0, "tie", 
+                                              ifelse(result < 0, away_team, "NA"))))
+```
+
+```{r, include = FALSE}
+pbpfull = pbpfull %>% mutate(poswins = ifelse(winteam == posteam,"PosWins","PosLoses")) %>%
+  mutate(poswins = fct_relevel(poswins, "PosLoses"))
+```
+
+```{r, include = FALSE}
+pbpfull = pbpfull %>% mutate(posspread = ifelse(posteam == home_team, spread_line, -1*spread_line))
+```
+
+```{r, include = FALSE}
+cols = c("qtr","down","poswins")
+pbpfull = pbpfull %>% mutate_at(cols,as_factor)
+
+pbpfull = pbpfull %>% drop_na(yardline_100) %>%
+  drop_na(game_seconds_remaining) %>%
+  drop_na(down) %>%
+  drop_na(posspread) %>%
+  drop_na(score_differential)
+
+pbpfull = pbpfull %>% filter(qtr != 5)
+
+pbpfull = pbpfull %>% filter(result != 0)
+```
+
+#### Model creation
+```{r}
+mod1 = glm(poswins ~ yardline_100 + game_seconds_remaining + down +
+             ydstogo + posspread + score_differential, data = pbpfull, family = "binomial")
+options(scipen = 999)
+summary(mod1)
+
+mod2 = glm(poswins ~ yardline_100 + game_seconds_remaining*score_differential + down +
+             ydstogo + posspread, data = pbpfull, family = "binomial")
+summary(mod2)
+```
+
+#### GLM Interaction term predictions
+```{r}
+library('caTools')
+sample<-sample.split(pbpfull$poswins, SplitRatio = .8)
+train<-subset(pbpfull, sample==TRUE)
+test<-subset(pbpfull, sample==FALSE)
+
+modtrain1 <- glm(poswins ~ (yardline_100 + score_differential + game_seconds_remaining + score_differential + down + ydstogo + posspread), data = train, family = binomial)
+glm.probs1 <- predict(modtrain1, newdata = test, type = "response")
+glm.pred1 <- ifelse(glm.probs1 > 0.5, 1, 0)
+table(glm.pred1,test$poswins)
+```
+
+
+#### EXPERIMENTAL Decision Tree
+```{r, include = FALSE}
+library(rpart)
+library(caret)
+
+train_index = sample(nrow(pbpfull), 0.8 * nrow(pbpfull))
+train_data = pbpfull[train_index,]
+test_data = pbpfull[-train_index,]
+
+tree_model = rpart(poswins ~ yardline_100 + game_seconds_remaining + 
+    down + ydstogo + posspread + score_differential, data = train_data, method = "class")
+```
+
+```{r, include = FALSE}
+tree_predictions = predict(tree_model, newdata = test_data, type = "class")
+
+confusionMatrix(tree_predictions, test_data$poswins)
+```
+
+```{r, include = FALSE}
+cp_optimal = tree_model$cptable[which.min(tree_model$cptable[,"xerror"]), "CP"]
+pruned_tree = prune(tree_model, cp = cp_optimal)
+
+pruned_predictions = predict(pruned_tree, newdata = test_data, type = "class")
+
+confusionMatrix(pruned_predictions, test_data$poswins)
+```
+
+#### EXPERIMENTAL Lasso Regression
+```{r, include = FALSE}
+library(glmnet)
+y = pbpfull$poswins
+
+x = data.matrix(pbpfull[, c('yardline_100', 'game_seconds_remaining', 'down', 'ydstogo', 'posspread', 'score_differential')])
+```
+
+```{r, include = FALSE}
+cv_model = cv.glmnet(x, y, alpha = 1, family = "binomial")
+
+best_lambda = cv_model$lambda.min
+best_lambda
+
+plot(cv_model)
+```
+
+```{r, include = FALSE}
+best_model = glmnet(x, y, alpha = 1, lambda = best_lambda, family = "binomial")
+
+predictor_columns = c('yardline_100', 'game_seconds_remaining', 'down', 'ydstogo', 'posspread', 'score_differential')
+
+response_column = 'poswins'
+```
+
+```{r, include = FALSE}
+train_prop = 0.8
+
+train_indices = sample(x = 1:nrow(x), size = floor(train_prop * nrow(x)))
+train_data_lasso = pbpfull[train_indices,]
+test_data_lasso = pbpfull[-train_indices,]
+
+train_x = data.matrix(train_data_lasso[, predictor_columns])
+train_y = train_data_lasso[[response_column]]
+
+test_x = data.matrix(test_data_lasso[, predictor_columns])
+test_y = test_data_lasso[[response_column]]
+```
+
+```{r, include = FALSE}
+predicted_classes = predict(best_model, newx = test_x, s = best_lambda, type = "class")
+
+predicted_vector = as.factor(as.vector(predicted_classes))
+
+true_classes = as.factor(test_y)
+
+confusionMatrix(predicted_vector, true_classes)
+```
+
+#### EXPERIMENTAL Random Forest
+```{r}
+library(randomForest)
+
+trainIndex = sample(1:nrow(pbpfull), 0.8 * nrow(pbpfull))
+trainData = pbpfull[trainIndex,]
+testData = pbpfull[-trainIndex,]
+
+#rf_model = randomForest(poswins ~ yardline_100 + game_seconds_remaining + down + ydstogo + posspread + score_differential, data = trainData)
+
+#predictions = predict(rf_model, testData)
+#confusionMatrix(predictions, testData$poswins)
+```
+
+#### The overall model
+```{r}
+rf_tuned = randomForest(poswins ~ yardline_100 + game_seconds_remaining + down + ydstogo + posspread + score_differential, data = trainData, ntree = 150, mtry = 6)
+
+print(rf_tuned)
+```
+
+# Find the optimal tree number for accuracy and computational expense.
+```{r}
+# The model used in this chunk used significantly more trees but was changed due to how long it took to run the model. Also, the rest of this chunk and the next one have been commented out because it takes a while for things to run.
+
+oob = as.data.frame(rf_tuned$err.rate)
+oob_error = oob$OOB
+
+plot_data = data.frame(
+  Ntree = 1:length(oob_error),
+  OOB_Error_Rate = oob_error
+)
+
+ggplot(plot_data, aes(x = Ntree, y = OOB_Error_Rate)) +
+  geom_line()
+```
+
+# Find the optimal mtry number.
+```{r}
+#rfGrid = expand.grid(mtry = 1:6)
+
+#rControl = trainControl(
+#  method = "cv",
+#  number = 5,
+#  verboseIter = T,
+#  classProbs = T,
+#  summaryFunction = twoClassSummary
+#)
+
+#rf_mtry = train(
+#  x = train_x,
+#  y = train_y,
+#  method = "rf",
+#  metric = "ROC",
+#  tuneGrid = rfGrid,
+#  trControl = trControl,
+#  ntree = 500
+#)
+
+#rf_mtry$bestTune
+```
+
+```{r}
+predictions_rf_matrix = predict(rf_tuned, newdata = pbpfull[,predictor_columns], type = "prob")
+
+predictions_prob_poswins = predictions_rf_matrix[,1]
+
+pbpfull = pbpfull %>% mutate(problog = predictions_prob_poswins) %>%
+  mutate(prob_home_log = ifelse(posteam == home_team, problog , 1-problog))
+```
+
+```{r}
+gameid = "2022_15_IND_MIN"
+homeid = pbpfull %>% filter(game_id == gameid) %>% select(home_team) %>% distinct()
+awayid = pbpfull %>% filter(game_id == gameid) %>% select(away_team) %>% distinct()
+
+vertical.lines = c(900, 1800, 2700, 3600)
+pbpfull %>% filter(game_id == "2022_15_IND_MIN") %>%
+  ggplot(aes(x=game_seconds_remaining,y=prob_home_log)) +
+  geom_rect(aes(xmin=0, xmax=3600, ymin=0.5, ymax=1), fill = "purple", alpha = 1) + geom_rect(aes(xmin=0, xmax=3600, ymin=0, ymax=0.5), fill = "blue", alpha = 1) + geom_line(size = 1) +
+  theme_bw() +
+  scale_x_reverse(breaks=seq(0,3600,by=450)) +
+  ylim(0,1) +
+  xlab("Game Time Remaining (seconds)") +
+  ylab("Home Team Win Probability") +
+  geom_vline(xintercept = vertical.lines, color = "red") +
+  annotate("label", x = 3500, y = .95, label = paste0(homeid$home_team)) +
+  annotate("label", x = 3500, y = .05, label = paste0(awayid$away_team))
+```
+
+```{r}
+predictions_log = predict(mod1, type = "response")
+
+#The code also modifies the probabilities to always be in terms of the home team. 
+#The predicted probabilities for the home team are stored in a variable called “prob_home_log”.
+
+pbpfull_glm = pbpfull %>% mutate(problog = predictions_log) %>%
+  mutate(prob_home_log = ifelse(posteam == home_team, problog , 1-problog))
+```
+
+
+```{r}
+vertical.lines = c(900, 1800, 2700, 3600)
+pbpfull_glm %>% filter(game_id == "2022_15_IND_MIN") %>%
+  ggplot(aes(x=game_seconds_remaining,y=prob_home_log)) +
+  geom_rect(aes(xmin=0, xmax=3600, ymin=0.5, ymax=1), fill = "#D3BC8D", alpha = 1) + geom_rect(aes(xmin=0, xmax=3600, ymin=0, ymax=0.5), fill = "#A71930", alpha = 1) + geom_line(size = 1) +
+  theme_bw() +
+  scale_x_reverse(breaks=seq(0,3600,by=450)) +
+  ylim(0,1) +
+  xlab("Game Time Remaining (seconds)") +
+  ylab("Home Team Win Probability") +
+  geom_vline(xintercept = vertical.lines, color = "red") +
+  annotate("label", x = 3500, y = .95, label = paste0(homeid$home_team)) +
+  annotate("label", x = 3500, y = .05, label = paste0(awayid$away_team))
+```
+
+```{r}
+# Filter for the game and select the first play
+game_data_start <- pbpfull %>%
+    filter(game_id == "2022_15_IND_MIN") %>%
+    arrange(game_seconds_remaining) %>%
+    slice_head(n = 1) %>%
+    select(posteam, home_team, spread_line, posspread)
+
+print(game_data_start)
+```
+
+# Question 3 (Customer Retention Model)
+
+```{r}
+New_Retention_Dataset = read_excel("C:/All class folders/Fall 2025/Sports Analytics/Week 12/New_Retention_Dataset.xlsx")
+
+Retention_Dataset<-New_Retention_Dataset
+```
+
+```{r}
+# Remove only one occurrence of each duplicate row, keeping the first occurrence
+Retention_unique <- Retention_Dataset[!duplicated(Retention_Dataset), ]
+
+# Convert all character columns to factors
+Retention_factor <- Retention_unique
+Retention_factor[] <- lapply(Retention_unique, function(x) if (is.character(x)) as.factor(x) else x)
+
+# Removes accounts with 'acct_id' equal to "0" or marked as comp accounts (FLAG_Comp == 1).
+Retention_remove <- Retention_factor[!(Retention_factor$acct_id == "0" | Retention_factor$FLAG_Comp == 1), ]
+
+# Filters to only include customers with Flag_Personal_or_Business_STM == 1 and those that previously purchased
+Retention_cust <- Retention_remove[Retention_remove$Flag_Personal_or_Business_STM == 1, ]
+
+# Step 3: Create a subset with baseline variables
+# Selects specific columns of interest for the model.
+CRmodeldata <- Retention_cust[c(1, 2, 6, 9:13, 22, 25:26, 31, 33:36)]
+
+# Ensures selected columns are numeric, important for any calculations.
+CRmodeldata$Non_Resale_Num_Games <- as.numeric(as.character(CRmodeldata$Non_Resale_Num_Games))
+CRmodeldata$Non_Resale_Scanned_Games <- as.numeric(as.character(CRmodeldata$Non_Resale_Scanned_Games))
+CRmodeldata$Resale_Markup <- as.numeric(as.character(CRmodeldata$Resale_Markup))
+```
+
+```{r}
+# Define years of consideration
+years <- c(2018, 2019, 2021, 2022, 2023)
+# Storing the number of repeats for each year in a list
+repeat_acct_by_year <- list()
+# Loop through each year to find repeated account IDs within that year (this is what was missing)
+for (year in years) {
+# Filter the data for the current year
+data_filtered_year <- subset(CRmodeldata, season_year == year)
+# Count the occurrences of account IDs for the current year
+acct_id_counts_year <- table(data_filtered_year$acct_id)
+# Find account IDs that repeat (appear more than once) in the current year
+repeat_acct_id_year <- acct_id_counts_year[acct_id_counts_year > 1]
+# Store the count of repeated account IDs for this year in the list
+repeat_acct_by_year[[as.character(year)]] <- length(repeat_acct_id_year)
+}
+```
+
+```{r}
+CRmodeldata <- CRmodeldata %>%
+  mutate(season_acct_id = paste0(season_year, "_", acct_id))
+#Account repeats in one year 
+#Define the years of interest
+years_of_interest <- c(2018, 2019, 2021, 2022, 2023)
+# Filter the dataset for the specified years
+data_filtered <- subset(CRmodeldata, season_year %in% years_of_interest)
+# Count occurrences of each acc_id in the filtered data
+acct_id_counts <- table(data_filtered$acct_id)
+# Find repeated acc_id (those with counts > 1)
+repeat_acct_id <- acct_id_counts[acct_id_counts > 1]
+# Number of repeat acc_id
+num_repeat_acct_id <- length(repeat_acct_id)
+```
+
+```{r}
+# Here we calculate summaries like total seats and most frequent attributes for each account-season.
+
+Model_dataID <- CRmodeldata %>%
+  group_by(season_acct_id) %>%
+  mutate(total_num_seats = sum(num_seats, na.rm = TRUE)) %>%
+  mutate(Most_Frequent_Class = names(sort(table(Class), decreasing = TRUE)[1])) %>%
+  mutate(Most_Frequent_Stadium_Classification = names(sort(table(Classification), decreasing = TRUE)[1])) %>%
+  mutate(Most_Frequent_Stadium_Level = names(sort(table(Stadium_Level), decreasing = TRUE)[1])) %>%
+  mutate(Most_Frequent_Stadium_Side = names(sort(table(Stadium_Side), decreasing = TRUE)[1])) %>%
+  mutate(Most_Frequent_Field_View = names(sort(table(Field_View), decreasing = TRUE)[1])) %>%
+  mutate(total_num_non_resale = sum(Non_Resale_Num_Games, na.rm = TRUE)) %>%
+  mutate(total_num_non_resale_scanned = sum(Non_Resale_Scanned_Games, na.rm = TRUE)) %>%
+  mutate(avg_resale_markup = if_else(all(is.na(Resale_Markup)), NA_real_, mean(Resale_Markup, na.rm = TRUE))) %>%
+  ungroup()
+```
+
+```{r}
+Model_datafinal <- Model_dataID %>% select(
+  c('season_year', 'acct_id', 'season_acct_id', 'total_num_seats', 
+    'Most_Frequent_Class', 'Most_Frequent_Stadium_Classification', 
+    'Most_Frequent_Stadium_Level', 'Most_Frequent_Stadium_Side', 
+    'Most_Frequent_Field_View', 'total_num_non_resale', 
+    'total_num_non_resale_scanned', 'avg_resale_markup', 
+    'Win_Pct', 'Playoff_Appearance', 'Playoff_Win', 'Hwin_Pct'))
+
+Model_datafinalcollapsed <- Model_datafinal %>%
+  group_by(season_acct_id) %>%
+  summarise(across(everything(), first), .groups = 'drop') %>%
+  mutate(across(starts_with("Most_Frequent"), as.factor))
+```
+
+```{r}
+Model_dataF <- Model_datafinalcollapsed
+Model_dataF$Retained <- 0  # Initialize 'Retained' column as 0
+
+mark_retained <- function(data, year1, year2) {
+  acct_id_both_years <- intersect(
+    data %>% filter(season_year == year1) %>% pull(acct_id),
+    data %>% filter(season_year == year2) %>% pull(acct_id)
+  )
+  data %>% mutate(Retained = ifelse(season_year == year1 & acct_id %in% acct_id_both_years, 1, Retained))
+}
+
+Model_dataF <- mark_retained(Model_dataF, 2018, 2019)
+Model_dataF <- mark_retained(Model_dataF, 2019, 2021)
+Model_dataF <- mark_retained(Model_dataF, 2021, 2022)
+Model_dataF <- mark_retained(Model_dataF, 2022, 2023)
+```
+
+```{r}
+# Step 10: Remove 2023 data and set 'Retained' as a factor
+Model_dataC <- Model_dataF %>%
+  filter(season_year != 2023) %>%
+  mutate(Retained = as.factor(Retained))
+# Question: Why do we remove 2023 data before modeling?
+
+Model_dataC<-na.omit(Model_dataC)
+```
+
+```{r}
+sample_cust<-sample.split(Model_dataC$Retained, SplitRatio = .75)
+train_cust<-subset(Model_dataC, sample_cust==TRUE)
+test_cust<-subset(Model_dataC, sample_cust==FALSE)
+
+modtrain_cust <- glm(Retained ~ (total_num_seats + Most_Frequent_Class + Most_Frequent_Stadium_Classification + Most_Frequent_Stadium_Level + Most_Frequent_Stadium_Side + 
+Most_Frequent_Field_View + total_num_non_resale + total_num_non_resale_scanned + avg_resale_markup + Win_Pct + Playoff_Appearance + Playoff_Win + Hwin_Pct), data = train_cust, family = binomial)
+
+
+glm.probs_cust <- predict(modtrain_cust, newdata = test_cust, type = "response")
+glm.pred_cust <- ifelse(glm.probs_cust > 0.5, 1, 0)
+table(glm.pred_cust,test_cust$Retained)
+```
+
+# Class weights to address class imbalance
+```{r}
+train_cust$Retained = as.factor(train_cust$Retained)
+
+class_counts = table(train_cust$Retained)
+
+total_obs = sum(class_counts)
+num_classes = length(class_counts)
+
+class_weights = total_obs / (num_classes * class_counts)
+
+observation_weights = ifelse(
+  train_cust$Retained == 0,
+  class_weights["0"],
+  class_weights["1"]
+)
+
+weighted_model = glm(Retained ~ (total_num_seats + Most_Frequent_Class + Most_Frequent_Stadium_Classification + Most_Frequent_Stadium_Level + Most_Frequent_Stadium_Side + 
+Most_Frequent_Field_View + total_num_non_resale + total_num_non_resale_scanned + avg_resale_markup + Playoff_Appearance + Playoff_Win), data = train_cust, family = binomial(link = "logit"), weights = observation_weights)
+
+prob_preds_weights = predict(weighted_model, newdata = test_cust, type = "response")
+
+glm.pred_test_classes = ifelse(prob_preds_weights > 0.35, 1, 0)
+glm.pred_test_classes = factor(glm.pred_test_classes, levels = c(0,1))
+
+test_cust$Retained = factor(test_cust$Retained, levels = c(0,1))
+
+table(Prediction = glm.pred_test_classes, Reference = test_cust$Retained)
+```
+
+```{r}
+summary(weighted_model)
+```
+
+
+```{r}
+# Assuming 'weighted_model' is your final weighted Logistic Regression model
+
+# 1. Extract the Coefficient Matrix from the model summary
+model_summary <- summary(weighted_model)
+coef_matrix <- model_summary$coefficients
+
+# 2. Convert the matrix to a data frame for easier manipulation
+coef_df_base <- as.data.frame(coef_matrix)
+colnames(coef_df_base) <- c("Estimate", "Std_Error", "Z_Value", "P_Value")
+
+# 3. Filter out the Intercept and prepare for display
+final_table_base <- subset(coef_df_base, rownames(coef_df_base) != "(Intercept)")
+
+# Select and reorder the final columns
+final_table_base <- final_table_base[, c("Estimate", "Std_Error", "Z_Value", "P_Value")]
+
+# 4. Sort by P-Value (to show the most statistically reliable drivers first)
+final_table_base_sorted <- final_table_base[order(abs(final_table_base$Z_Value), decreasing = T), ]
+
+# Format P-Value for better display
+final_table_base_sorted$P_Value <- format.pval(final_table_base_sorted$P_Value, digits = 5, eps = 1e-10)
+
+# Display the top results
+print("--- Sorted Statistical Summary of Logistic Model Drivers ---")
+print(head(final_table_base_sorted, 10))
+```
+
